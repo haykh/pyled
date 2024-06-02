@@ -1,5 +1,6 @@
-from typing import Callable
+from typing import Any, Callable
 from .commands import CMD
+import time
 
 
 class Device:
@@ -39,13 +40,33 @@ class Device:
         """
         sconn.write(Device.FWK_MAGIC + [CMD.DrawGreyColBuffer, 0x00])
 
-    def __init__(self, id: int, port) -> None:
+    def __init__(self, id: int, port: Any, keep_alive: bool = False) -> None:
         self.id = id
         self.port = port
-        self.connected = True
+        self.sconn = None
+        self.connected = False
+        if keep_alive:
+            self.connect()
+
+    def connect(self) -> None:
+        import serial
+
+        if not self.connected:
+            assert self.sconn is None, "Serial connection is not None"
+            self.connected = True
+            self.sconn = serial.Serial(self.port.device, 115200)
+        else:
+            assert self.sconn is not None, "Serial connection is None"
 
     def disconnect(self) -> None:
-        self.connected = False
+        if self.connected:
+            self.sconn.close()
+            self.sconn = None
+            self.connected = False
+
+    def __del__(self) -> None:
+        self.brightness(0)
+        self.disconnect()
 
     def execute(
         self, command: Callable[[serial.Serial], None], expect_response=False
@@ -65,15 +86,18 @@ class Device:
             `IOError`: If an I/O error occurs during the execution of the command.
             `Exception`: If an unexpected error occurs during the execution of the command.
         """
-        if not self.connected:
-            raise RuntimeError("Device is not connected")
         import serial
 
         try:
-            with serial.Serial(self.port.device, 115200) as sconn:
-                command(sconn)
+            if self.sconn is None:
+                with serial.Serial(self.port.device, 115200) as sconn:
+                    command(sconn)
+                    if expect_response:
+                        return sconn.read(Device.RESPONSE_SIZE)
+            else:
+                command(self.sconn)
                 if expect_response:
-                    return sconn.read(Device.RESPONSE_SIZE)
+                    return self.sconn.read(Device.RESPONSE_SIZE)
 
         except (IOError, OSError) as ex:
             self.disconnect()
@@ -81,17 +105,33 @@ class Device:
         except Exception as ex:
             raise RuntimeError(f"Error: {ex}")
 
+    def animate(
+        self,
+        method: str,
+        frames: Callable,
+        fps: int = 30,
+        ntimes: int = 100,
+        brightness: int = 255,
+    ) -> None:
+        dt = 1.0 / fps
+        n = 0
+        now = time.perf_counter()
+        ngen = ntimes + 1
+        kwargs = None
+        while ntimes > 0:
+            if ngen == ntimes + 1:
+                kwargs = frames(n)
+                ngen -= 1
+            if kwargs is None:
+                break
+            if time.perf_counter() - now > dt:
+                print(n)
+                getattr(self, method)(**kwargs)
+                now = time.perf_counter()
+                ntimes -= 1
+                n += 1
+
     def paint(self, array: list[list[float]], brightness: int = 255) -> None:
-        """
-        Paints a greyscale image on the device.
-
-        Args:
-            `array` (`list[list[float]]`): A 2D array of greyscale values representing the image 0 <= value < 1.
-            `brightness` (`int`): The brightness value to set.
-
-        Raises:
-            `ValueError`: If the dimensions of the input array do not match the device's screen size.
-        """
         if len(array) != Device.WIDTH or any(
             len(row) != Device.HEIGHT for row in array
         ):
@@ -118,16 +158,6 @@ class Device:
         self.execute(lambda sconn: paint_image(sconn, array))
 
     def display(self, array: list[list[bool]], brightness: int = 255) -> None:
-        """
-        Displays a binary image on the device.
-
-        Args:
-            `array` (`list[list[bool]]`): A 2D array of boolean values representing the image.
-            brightness (`int`): The brightness value to set.
-
-        Raises:
-            `ValueError`: If the dimensions of the input array do not match the device's screen size or if the brightness value is out of range.
-        """
         if len(array) != Device.WIDTH or any(
             len(row) != Device.HEIGHT for row in array
         ):
@@ -142,42 +172,16 @@ class Device:
         self.brightness(brightness)
 
     def brightness(self, value: int) -> None:
-        """
-        Sets the brightness of the device.
-
-        Args:
-            `value` (`int`): The brightness value to set.
-
-        Raises:
-            `ValueError`: If the brightness value is out of range.
-        """
         assert 0 <= value <= 255
         self.command(CMD.Brightness, [value])
 
     def sleep(self) -> None:
-        """
-        Puts the device to sleep.
-        """
         self.command(CMD.Sleep, [True])
 
     def wake(self) -> None:
-        """
-        Wakes the device from sleep.
-        """
         self.command(CMD.Sleep, [False])
 
     def command(self, command: CMD, params=[], expect_response=False) -> None | bytes:
-        """
-        Sends a command to the device.
-
-        Args:
-            `command` (`CMD`): The command to send to the device.
-            `params` (`list`): The list of parameters to send with the command.
-            `expect_response` (`bool`): A flag to indicate whether to expect a response from the device.
-
-        Returns:
-            `bytes` | `None`: The response from the device if `expect_response` is set to `True`.
-        """
         return self.execute(
             lambda sconn: sconn.write(Device.FWK_MAGIC + [command] + params),
             expect_response,
